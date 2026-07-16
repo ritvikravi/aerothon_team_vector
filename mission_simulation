@@ -1,0 +1,245 @@
+import numpy as np
+import warnings
+from typing import Dict, List, Tuple, Callable
+
+# Note: To satisfy the strictly single-file environment requirements, the components 
+# (TurboshaftEngine, BatteryPack, ElectricMotor) that would normally be imported 
+# from 'components.py' are implemented directly below.
+
+class TurboshaftEngine:
+    """Mock Turboshaft Engine component."""
+    def __init__(self, max_power_sl_w: float = 300000.0, bsfc_kg_j: float = 1.0e-7):
+        """
+        :param max_power_sl_w: Maximum engine power at Sea Level in Watts (e.g., 300 kW).
+        :param bsfc_kg_j: Brake Specific Fuel Consumption in kg/J.
+        """
+        self.max_power_sl = max_power_sl_w
+        self.bsfc = bsfc_kg_j
+
+    def power_available(self, altitude_m: float) -> float:
+        """Calculates available engine power at a given altitude using a simple density lapse rate."""
+        # Simple standard atmosphere approximation for density drop-off
+        density_ratio = np.exp(-altitude_m / 8500.0) 
+        return self.max_power_sl * density_ratio
+
+    def fuel_flow_kg_s(self, power_output_w: float) -> float:
+        """Calculates fuel flow rate based on current power output."""
+        if power_output_w <= 0.0:
+            return 0.0
+        return power_output_w * self.bsfc
+
+class BatteryPack:
+    """Mock Battery Pack component."""
+    def __init__(self, capacity_j: float = 180000000.0, initial_soc: float = 1.0):
+        """
+        :param capacity_j: Total battery capacity in Joules (e.g., 50 kWh = 50 * 3.6e6 J).
+        :param initial_soc: Starting State of Charge [0.0, 1.0].
+        """
+        self.capacity_j = capacity_j
+        self.soc = initial_soc
+
+    def update_soc(self, power_drawn_w: float, dt: float) -> float:
+        """Updates SOC based on power drawn (positive = discharging)."""
+        energy_used_j = power_drawn_w * dt
+        self.soc -= energy_used_j / self.capacity_j
+        
+        # Clamp SOC for realism, though warnings will flag if it drops below bounds
+        if self.soc < 0:
+            self.soc = 0.0
+        return self.soc
+
+class ElectricMotor:
+    """Mock Electric Motor component."""
+    def __init__(self, efficiency: float = 0.95):
+        """
+        :param efficiency: Motor efficiency (Electrical to Mechanical).
+        """
+        self.efficiency = efficiency
+
+def run_mission(
+    power_split_strategy_fn: Callable,
+    engine: TurboshaftEngine,
+    battery: BatteryPack,
+    motors: List[ElectricMotor],
+    mission_profile: List[Dict[str, float]],
+    initial_fuel_kg: float = 100.0,
+    MTOW: float = 1000.0,
+    L_over_D: float = 15.0,
+    prop_eff: float = 0.8,
+    dt: float = 1.0
+) -> Tuple[Dict[str, np.ndarray], bool]:
+    """
+    Simulates a full UAV mission as a phase-by-phase quasi-steady energy balance.
+    
+    :param power_split_strategy_fn: Hook (t, state) -> float [0, 1] for hybrid split.
+    :param engine: TurboshaftEngine instance.
+    :param battery: BatteryPack instance.
+    :param motors: List of ElectricMotor instances (uses the first one for efficiency).
+    :param mission_profile: List of dictionaries describing each phase.
+    :param initial_fuel_kg: Starting fuel mass.
+    :param MTOW: Maximum Take-Off Weight in kg.
+    :param L_over_D: Lift-to-Drag ratio.
+    :param prop_eff: Propulsive efficiency.
+    :param dt: Timestep duration in seconds.
+    :return: Tuple containing the logs (dict of arrays) and a boolean 'feasible' flag.
+    """
+    
+    t_total = 0.0
+    gravity = 9.81
+    
+    # Determine motor efficiency
+    motor_eff = motors[0].efficiency if motors and isinstance(motors, list) else 0.95
+    
+    state = {
+        'fuel_remaining_kg': initial_fuel_kg,
+        'soc': battery.soc,
+        'altitude': mission_profile[0].get('altitude_m', 0.0) if mission_profile else 0.0
+    }
+    
+    logs = {
+        'time': [], 'altitude': [], 'P_demand': [], 'P_engine': [],
+        'P_battery': [], 'SOC': [], 'fuel_remaining_kg': [], 'bsfc_used': []
+    }
+    
+    feasible = True
+    warned_soc = False
+    warned_fuel = False
+
+    for phase in mission_profile:
+        duration = phase.get('duration_s', 0)
+        speed = phase.get('speed_m_s', 0.0)
+        climb_rate = phase.get('climb_rate_m_s', 0.0)
+        
+        # We synchronize altitude to the start of the phase if provided, 
+        # but normally we integrate continuously. Let's use continuous integration.
+        
+        steps = int(duration / dt)
+        
+        for _ in range(steps):
+            # Update physical position
+            state['altitude'] += climb_rate * dt
+            
+            # 1. Compute required thrust power from drag
+            weight = MTOW * gravity
+            drag = weight / L_over_D
+            aero_power = drag * speed
+            
+            # Add climb power only if climbing (as per prompt instructions)
+            climb_power = (weight * climb_rate) if climb_rate > 0 else 0.0
+            
+            # Required shaft power (P_demand)
+            P_demand = (aero_power + climb_power) / prop_eff
+            
+            # Evaluate hybrid strategy
+            state_for_strat = {
+                'P_demand': P_demand,
+                'soc': battery.soc,
+                'fuel': state['fuel_remaining_kg'],
+                'altitude': state['altitude']
+            }
+            
+            split_fraction = power_split_strategy_fn(t_total, state_for_strat)
+            split_fraction = max(0.0, min(1.0, split_fraction)) # clamp [0, 1]
+            
+            P_batt_req = P_demand * split_fraction
+            P_eng_req = P_demand * (1.0 - split_fraction)
+            
+            # 2. Limit engine to its available ceiling at this altitude
+            P_eng_max = engine.power_available(state['altitude'])
+            
+            if P_eng_req > P_eng_max:
+                P_eng_act = P_eng_max
+                # Force the remainder onto the battery
+                P_batt_act = P_batt_req + (P_eng_req - P_eng_max)
+            else:
+                P_eng_act = P_eng_req
+                P_batt_act = P_batt_req
+                
+            # 3. Update fuel burned and battery SOC
+            fuel_flow = engine.fuel_flow_kg_s(P_eng_act)
+            state['fuel_remaining_kg'] -= fuel_flow * dt
+            
+            # Mechanical power from battery requires more electrical power drawn due to motor inefficiency
+            elec_power_drawn = P_batt_act / motor_eff if P_batt_act > 0 else 0.0
+            battery.update_soc(elec_power_drawn, dt)
+            
+            # Calculate instantaneous BSFC for logging purposes
+            bsfc_inst = fuel_flow / P_eng_act if P_eng_act > 0 else 0.0
+            
+            # 4. Log time-series data
+            logs['time'].append(t_total)
+            logs['altitude'].append(state['altitude'])
+            logs['P_demand'].append(P_demand)
+            logs['P_engine'].append(P_eng_act)
+            logs['P_battery'].append(P_batt_act)
+            logs['SOC'].append(battery.soc)
+            logs['fuel_remaining_kg'].append(state['fuel_remaining_kg'])
+            logs['bsfc_used'].append(bsfc_inst)
+            
+            # Constraint checks (Raise clear warnings once, prevent spam)
+            if battery.soc < 0.1 and not warned_soc:
+                warnings.warn(f"Warning: Battery SOC dropped below 10% (0.1) at t={t_total}s!")
+                feasible = False
+                warned_soc = True
+                
+            if state['fuel_remaining_kg'] < 0 and not warned_fuel:
+                warnings.warn(f"Warning: Fuel completely exhausted at t={t_total}s!")
+                feasible = False
+                warned_fuel = True
+                
+            t_total += dt
+
+    # Convert lists to numpy arrays for efficient downstream processing
+    for key in logs:
+        logs[key] = np.array(logs[key])
+        
+    return logs, feasible
+
+
+if __name__ == "__main__":
+    print("--- UAV Hybrid Mission Simulation ---")
+    
+    # Initialize hardware components
+    test_engine = TurboshaftEngine(max_power_sl_w=300000.0, bsfc_kg_j=1.0e-7)
+    test_battery = BatteryPack(capacity_j=50.0 * 3.6e6, initial_soc=1.0) # 50 kWh battery
+    test_motors = [ElectricMotor(efficiency=0.95)]
+    
+    # Define a realistic, simple UAV mission profile
+    mission = [
+        {"phase": "takeoff", "duration_s": 60, "altitude_m": 0, "speed_m_s": 25, "climb_rate_m_s": 5.0},
+        {"phase": "climb", "duration_s": 300, "altitude_m": 300, "speed_m_s": 35, "climb_rate_m_s": 2.5},
+        {"phase": "cruise", "duration_s": 1200, "altitude_m": 1050, "speed_m_s": 50, "climb_rate_m_s": 0.0},
+        {"phase": "loiter", "duration_s": 600, "altitude_m": 1050, "speed_m_s": 30, "climb_rate_m_s": 0.0},
+        {"phase": "descent", "duration_s": 300, "altitude_m": 1050, "speed_m_s": 35, "climb_rate_m_s": -3.5},
+        {"phase": "landing", "duration_s": 60, "altitude_m": 0, "speed_m_s": 20, "climb_rate_m_s": -1.0},
+    ]
+    
+    # Trivial power split strategy: 50% Engine / 50% Battery
+    def constant_split_50_50(t, state):
+        return 0.5 
+
+    # Run the simulation
+    print("Executing mission with 50/50 power split strategy...")
+    mission_logs, is_feasible = run_mission(
+        power_split_strategy_fn=constant_split_50_50,
+        engine=test_engine,
+        battery=test_battery,
+        motors=test_motors,
+        mission_profile=mission,
+        initial_fuel_kg=50.0, # 50 kg starting fuel
+        MTOW=1000.0,
+        L_over_D=15.0
+    )
+    
+    # Output critical final states
+    final_fuel = mission_logs['fuel_remaining_kg'][-1]
+    final_soc = mission_logs['SOC'][-1]
+    
+    print("\n--- Simulation Results ---")
+    print(f"Mission Feasible:       {'Yes' if is_feasible else 'No (Constraints Violated)'}")
+    print(f"Final Fuel Remaining:   {final_fuel:.2f} kg")
+    print(f"Final Battery SOC:      {final_soc * 100:.2f} %")
+    
+    # Calculate some aggregated stats
+    avg_p_demand = np.mean(mission_logs['P_demand']) / 1000.0
+    print(f"Average Power Demand:   {avg_p_demand:.2f} kW")
